@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.log
+tmp/
+runs/
+checkpoint-*/
+qwen-coder-rm-hh/
+qwen-coder-rm-quickstart/
+qwen-coder-grpo-hh/
+qwen-coder-grpo-quickstart/
+.DS_Store
