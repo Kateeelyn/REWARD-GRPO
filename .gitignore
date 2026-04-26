@@ -1,0 +1,32 @@
+# env / cache
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+.idea/
+
+# logs
+*.log
+
+# training artifacts
+runs/
+checkpoint-*/
+qwen-coder-rm-hh/
+qwen-coder-rm-quickstart/
+qwen-coder-grpo-hh/
+qwen-coder-grpo-hh-rerun/
+qwen-coder-grpo-quickstart/
+
+# results
+results/
+
+# datasets / generated jsonl
+hh_eval_500.jsonl
+hh_train_3k.jsonl
+quickstart_prefs.jsonl
+quickstart_prompts.jsonl
+
+# archives
+*.zip
+*.tar.gz
