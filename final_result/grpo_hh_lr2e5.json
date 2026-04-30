@@ -1,0 +1,9 @@
+{
+  "model": "./qwen-coder-grpo-hh-lr2e5",
+  "eval_file": "hh_eval_500.jsonl",
+  "num_pairs": 500,
+  "preference_accuracy": 0.52,
+  "rm_score_mean": -0.09387347412109374,
+  "rm_score_median": -0.0037689208984375,
+  "mean_response_length": 201.754
+}

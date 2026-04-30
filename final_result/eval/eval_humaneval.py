@@ -1,0 +1,306 @@
+"""
+eval/eval_humaneval.py
+----------------------
+Generate greedy completions for all 164 HumanEval problems and report pass@1.
+
+Uses the `evalplus` library (pip install evalplus) which extends the original
+HumanEval benchmark with additional tests.  Falls back to the `human_eval`
+library if evalplus is not installed.
+
+Usage
+-----
+# Baseline:
+python eval/eval_humaneval.py \
+    --model_path Qwen/Qwen2.5-Coder-1.5B-Instruct \
+    --out results/baseline_humaneval.json
+
+# DPO checkpoint:
+python eval/eval_humaneval.py \
+    --model ./qwen-coder-dpo \
+    --out results/dpo_humaneval.json
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def _load_model(model_path: str, use_4bit: bool = False):
+    """
+    Load a model from a HuggingFace name or local path.
+
+    If the path contains adapter_config.json (a LoRA adapter checkpoint saved
+    by TRL's trainer.save_model()), the base model is loaded from the path
+    recorded in adapter_config.json and the adapter is merged in-memory before
+    returning.  This lets the eval scripts accept the raw training output
+    directory (e.g. ./qwen-coder-dpo-hh) without a separate merge step.
+    """
+    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    adapter_cfg = os.path.join(model_path, "adapter_config.json") if os.path.isdir(model_path) else ""
+    is_peft = os.path.exists(adapter_cfg)
+
+    if is_peft:
+        with open(adapter_cfg) as f:
+            base_name = json.load(f)["base_model_name_or_path"]
+        print(f"  Detected LoRA adapter. Base model: {base_name}")
+        from peft import PeftModel
+        if use_4bit:
+            from transformers import BitsAndBytesConfig
+            bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch_dtype)
+            base = AutoModelForCausalLM.from_pretrained(
+                base_name, quantization_config=bnb, device_map="auto", trust_remote_code=True
+            )
+        else:
+            base = AutoModelForCausalLM.from_pretrained(
+                base_name, torch_dtype=torch_dtype, device_map="auto", trust_remote_code=True
+            )
+        model = PeftModel.from_pretrained(base, model_path)
+        model = model.merge_and_unload()
+        print("  Adapter merged into base model.")
+    else:
+        if use_4bit:
+            from transformers import BitsAndBytesConfig
+            bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch_dtype)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path, quantization_config=bnb, device_map="auto", trust_remote_code=True
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path, torch_dtype=torch_dtype, device_map="auto", trust_remote_code=True
+            )
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+
+def _build_prompt(tokenizer, task_prompt: str) -> str:
+    """
+    Wrap the raw HumanEval task prompt for the model.
+
+    Instruct models (e.g. Qwen2.5-Coder-*-Instruct) require input formatted
+    via the chat template.  Without it they generate conversational text
+    instead of code, collapsing pass@1 from ~65% to ~18%.
+
+    Base models (no chat_template) receive the raw prompt directly, which is
+    the standard HumanEval completion-style setup.
+    """
+    if getattr(tokenizer, "chat_template", None):
+        messages = [{
+            "role": "user",
+            "content": (
+                "Complete the body of the following Python function. "
+                "Output only the code, no explanation:\n\n" + task_prompt
+            ),
+        }]
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    return task_prompt
+
+
+def _extract_code(response: str) -> str:
+    """
+    Strip markdown fences and return plain Python code.
+
+    evalplus.sanitize searches for 'def <entry_point>' inside the completion
+    and returns "" when it cannot find it.  Instruct models return the function
+    *body* (indented, no 'def' header), so sanitize always strips them to "".
+    Instead we just remove the ```python ... ``` wrapper ourselves and pass the
+    raw code straight to evalplus.evaluate.
+    """
+    blocks = re.findall(r"```(?:python)?\n?(.*?)```", response, re.DOTALL)
+    if blocks:
+        return blocks[-1]
+    return response
+
+
+def _stop_token_ids(tokenizer) -> list:
+    """
+    Collect EOS / end-of-turn token IDs for the model.
+
+    Qwen models use <|im_end|> as the end-of-turn token.  Including it here
+    stops generation at the natural end of the assistant turn instead of
+    continuing into padding or hallucinated turns.
+    """
+    ids = [tokenizer.eos_token_id]
+    for name in ["<|im_end|>", "<|endoftext|>", "<|EOT|>"]:
+        tid = tokenizer.convert_tokens_to_ids(name)
+        if tid and tid != tokenizer.unk_token_id and tid not in ids:
+            ids.append(tid)
+    return ids
+
+
+@torch.no_grad()
+def generate_completion(model, tokenizer, task_prompt: str, max_new_tokens: int = 512) -> str:
+    """Greedy decode a single completion for one HumanEval task prompt."""
+    prompt_text = _build_prompt(tokenizer, task_prompt)
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=_stop_token_ids(tokenizer),
+    )
+    return tokenizer.decode(
+        outputs[0, inputs.input_ids.shape[1]:], skip_special_tokens=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", required=True,
+                   help="HF model name or local path to the policy checkpoint")
+    p.add_argument("--out", default="results/humaneval_results.json",
+                   help="Path to write the JSON results file")
+    p.add_argument("--max_new_tokens", type=int, default=512)
+    p.add_argument("--use_4bit", action="store_true")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    # Derive a samples directory from the output file location.
+    out_dir = os.path.dirname(args.out) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    samples_path = os.path.join(out_dir, "samples.jsonl")
+
+    # ------------------------------------------------------------------
+    # Load model (handles both full models and LoRA adapter checkpoints)
+    # ------------------------------------------------------------------
+    print(f"Loading model: {args.model}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = _load_model(args.model, use_4bit=args.use_4bit)
+    model.eval()
+
+    # ------------------------------------------------------------------
+    # Load HumanEval problems
+    # ------------------------------------------------------------------
+    try:
+        from evalplus.data import get_human_eval_plus
+        problems = get_human_eval_plus()
+        print(f"Loaded {len(problems)} HumanEval+ problems via evalplus")
+        use_evalplus = True
+    except ImportError:
+        try:
+            from human_eval.data import read_problems
+            problems = read_problems()
+            print(f"Loaded {len(problems)} HumanEval problems via human-eval")
+            use_evalplus = False
+        except ImportError:
+            print("ERROR: neither evalplus nor human-eval is installed.")
+            print("Install with: pip install evalplus  OR  pip install human-eval")
+            sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Generate completions
+    # ------------------------------------------------------------------
+    print(f"Generating completions for {len(problems)} problems ...")
+    samples = []
+    for i, (task_id, task) in enumerate(problems.items()):
+        completion = generate_completion(
+            model, tokenizer, task["prompt"], args.max_new_tokens
+        )
+        samples.append({"task_id": task_id, "completion": _extract_code(completion)})
+        if (i + 1) % 20 == 0:
+            print(f"  {i+1}/{len(problems)} done ...")
+
+    # Write raw samples.jsonl
+    with open(samples_path, "w") as f:
+        for s in samples:
+            f.write(json.dumps(s) + "\n")
+    print(f"Wrote {len(samples)} completions to {samples_path}")
+
+    # ------------------------------------------------------------------
+    # NOTE: We intentionally skip evalplus.sanitize here.
+    # evalplus.sanitize searches for 'def <entry_point>' in the completion
+    # and strips it to "" when not found.  Instruct models output the function
+    # body (indented, no 'def' header), so sanitize always produces empty
+    # completions → pass@1 = 0.0.  We run _extract_code() during generation
+    # above to strip markdown fences; no further sanitization is needed.
+    eval_samples_path = samples_path
+
+    # ------------------------------------------------------------------
+    # Evaluate pass@1
+    # ------------------------------------------------------------------
+    print("Running pass@1 evaluation ...")
+
+    pass_at_1 = None
+
+    if use_evalplus:
+        cmd = [
+            sys.executable, "-m", "evalplus.evaluate",
+            "--dataset", "humaneval",
+            "--samples", eval_samples_path,
+        ]
+        # Delete any stale cached result file so evalplus always re-evaluates.
+        stem = os.path.splitext(eval_samples_path)[0]
+        stale = stem + "_eval_results.json"
+        if os.path.exists(stale):
+            os.remove(stale)
+            print(f"Removed stale cache: {stale}")
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        # Always print full subprocess output so failures are visible.
+        if result.stdout:
+            print("=== evalplus stdout ===")
+            print(result.stdout)
+        if result.stderr:
+            print("=== evalplus stderr ===")
+            print(result.stderr)
+        if result.returncode != 0:
+            print(f"WARNING: evalplus.evaluate exited with code {result.returncode}")
+
+        # Newer evalplus versions store per-problem data in the JSON file and
+        # only print the aggregate pass@1 to stdout.  Parse stdout directly —
+        # it is the authoritative source regardless of evalplus version.
+        # The first "pass@1:" line is the base HumanEval score (standard M4).
+        # The second is the stricter evalplus+ score (base + extra tests).
+        for line in result.stdout.splitlines():
+            if line.strip().startswith("pass@1:"):
+                try:
+                    pass_at_1 = float(line.split(":")[1].strip())
+                    break  # take first occurrence = base HumanEval pass@1
+                except (ValueError, IndexError):
+                    pass
+
+        if pass_at_1 is None:
+            print("ERROR: could not parse pass@1 from evalplus output.")
+            print("Full stdout was:", repr(result.stdout))
+    else:
+        from human_eval.evaluation import evaluate_functional_correctness
+        eval_data = evaluate_functional_correctness(eval_samples_path)
+        pass_at_1 = eval_data.get("pass@1", None)
+
+    summary = {
+        "model": args.model,
+        "n_problems": len(problems),
+        "M4_humaneval_pass_at_1": pass_at_1,
+    }
+    with open(args.out, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\nResults written to {args.out}")
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()

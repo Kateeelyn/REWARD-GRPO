@@ -1,0 +1,9 @@
+{
+  "model": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+  "eval_file": "hh_eval_500.jsonl",
+  "num_pairs": 500,
+  "preference_accuracy": 0.52,
+  "rm_score_mean": -0.4137942504882812,
+  "rm_score_median": -0.0069122314453125,
+  "mean_response_length": 158.794
+}

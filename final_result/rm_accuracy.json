@@ -1,0 +1,14 @@
+{
+  "rm_path": "./qwen-coder-rm-hh/checkpoint-9976",
+  "eval_file": "hh_eval_500.jsonl",
+  "n_pairs": 500,
+  "rm_accuracy_pairwise": 0.638,
+  "chosen_score_mean": -1.9029091796875,
+  "rejected_score_mean": -2.7668572998046876,
+  "chosen_minus_rejected_mean": 0.8639481201171877,
+  "base_policy_gen_score_mean": 0.1734375,
+  "base_policy_gen_score_median": 0.30078125,
+  "chosen_minus_base_gen_mean": -2.0763466796875,
+  "base_policy_gen_mean_length": 168.46,
+  "n_base_generation_probes": 50
+}
